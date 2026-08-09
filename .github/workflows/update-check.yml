@@ -37,28 +37,10 @@ jobs:
           set -euo pipefail
 
           mapfile -t targets <<'EOF'
-          aquamarine|hyprwm/aquamarine
           discord|discord
-          glaze|stephenberry/glaze
-          hyprcursor|hyprwm/hyprcursor
-          hyprgraphics|hyprwm/hyprgraphics
-          hypridle|hyprwm/hypridle
-          hyprland|hyprwm/Hyprland
-          hyprland-protocols|hyprwm/hyprland-protocols
-          hyprlang|hyprwm/hyprlang
-          hyprlock|hyprwm/hyprlock
-          hyprpaper|hyprwm/hyprpaper
-          hyprpicker|hyprwm/hyprpicker
-          hyprtoolkit|hyprwm/hyprtoolkit
-          hyprutils|hyprwm/hyprutils
-          hyprwayland-scanner|hyprwm/hyprwayland-scanner
-          hyprwire|hyprwm/hyprwire
-          libspng|randy408/libspng
           teams-for-linux|IsmaelMartinez/teams-for-linux
           webcord|SpacingBat3/WebCord
           spotify|spotify
-          sdbus-cpp|Kistler-Group/sdbus-cpp
-          xdg-desktop-portal-hyprland|hyprwm/xdg-desktop-portal-hyprland
           cavaii|Crisis82/cavaii
           calci|Crisis82/calci
           EOF
@@ -157,35 +139,9 @@ jobs:
             sed -i "s/^revision=.*/revision=1/" "$template"
             sed -i "s/^checksum=.*/checksum=${new_checksum}/" "$template"
 
-            if [ -f shlibs_append ]; then
-              soversion=""
-              if grep -qE "[[:space:]]${pkg}-" shlibs_append; then
-                extract_dir="/tmp/${pkg}-${latest_version}-extract"
-                rm -rf "$extract_dir"
-                mkdir -p "$extract_dir"
-                if tar -xzf "$tmp_file" -C "$extract_dir" 2>/dev/null; then
-                  soversion="$(grep -RhoE 'SOVERSION[[:space:]]+[0-9]+' "$extract_dir" 2>/dev/null | grep -oE '[0-9]+' | sort -u | head -n1 || true)"
-                fi
-              fi
-
-              awk -v pkg="$pkg" -v pkgver="${pkg}-${latest_version}_1" -v soversion="$soversion" '{
-                if (index($2, pkg "-") == 1) {
-                  $2 = pkgver
-                  if (soversion != "" && $1 ~ /\.so\.[0-9]+$/) {
-                    sub(/\.so\.[0-9]+$/, ".so." soversion, $1)
-                  }
-                }
-                print
-              }' shlibs_append > shlibs_append.tmp && mv shlibs_append.tmp shlibs_append
-            fi
-
             printf "%s: %s -> %s\n" "$pkg" "$current_version" "$latest_version" >> updates.txt
             updates=1
           done
-
-          if [ -f shlibs_append ]; then
-            sort -u -o shlibs_append shlibs_append
-          fi
 
           if [ "$updates" -eq 1 ]; then
             echo "updates_found=true" >> "$GITHUB_OUTPUT"
@@ -203,7 +159,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch"
-          git add srcpkgs shlibs_append
+          git add srcpkgs
 
           if git diff --cached --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
@@ -223,8 +179,8 @@ jobs:
           set -euo pipefail
           owner="${REPO%/*}"
           repo="${REPO#*/}"
-          branch="auto/update-packages"
-          title="chore: update package versions and checksums"
+          branch="main"
+          title="update package versions and checksums"
           updates_payload="$(cat updates.txt)"
           updates_hash="$(printf "%s" "$updates_payload" | sha256sum | awk '{print $1}')"
           body=$(cat <<EOF
