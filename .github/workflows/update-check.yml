@@ -154,7 +154,7 @@ jobs:
         id: commit_updates
         run: |
           set -euo pipefail
-          branch="auto/update-packages"
+          branch="master"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -179,7 +179,7 @@ jobs:
           set -euo pipefail
           owner="${REPO%/*}"
           repo="${REPO#*/}"
-          branch="main"
+          branch="master"
           title="update package versions and checksums"
           updates_payload="$(cat updates.txt)"
           updates_hash="$(printf "%s" "$updates_payload" | sha256sum | awk '{print $1}')"
