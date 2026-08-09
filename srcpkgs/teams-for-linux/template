@@ -35,6 +35,19 @@ do_extract() {
 do_install() {
 	vcopy opt /
 	vcopy usr /
+
+	# Remove any bundled musl libraries or binaries that may have been extracted
+	# from the upstream .deb. These can trigger auto-detected run_depends for musl
+	# which break glibc-based repositories.
+	# 1) Remove files with musl in their filename.
+	find "${DESTDIR}" -type f -iname '*musl*' -exec rm -f {} \; || true
+
+	# 2) Remove ELF files that dynamically link against musl (safer detection).
+	if command -v ldd >/dev/null 2>&1; then
+		while IFS= read -r _f; do
+			rm -f "$_f" || true
+		done < <(find "${DESTDIR}" -type f -exec sh -c 'file -L "$1" | grep -qi "elf" && (ldd "$1" 2>/dev/null || true) | grep -qi "musl" && printf "%s\n" "$1"' _ {})
+	fi
 }
 
 post_install() {
