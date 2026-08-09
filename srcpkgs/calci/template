@@ -1,0 +1,21 @@
+# Template file for 'calci'
+pkgname=calci
+version=0.2.1
+revision=1
+build_style=cargo
+hostmakedepends="pkg-config"
+makedepends="oniguruma-devel"
+short_desc="Markdown TUI renderer with math support"
+maintainer="Crisis82 <crisis82@users.noreply.github.com>"
+license="MIT"
+homepage="https://github.com/Crisis82/calci"
+distfiles="${homepage}/archive/refs/tags/v${version}.tar.gz"
+checksum=8604e3f5fa99c3b3204df00d149b4ce6234db93b7755d589a9b0b58d24403c05
+
+do_install() {
+  vbin target/${RUST_TARGET}/release/calci
+}
+
+post_install() {
+  vlicense LICENSE
+}

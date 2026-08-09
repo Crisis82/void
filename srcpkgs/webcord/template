@@ -1,0 +1,41 @@
+# Template file for 'webcord'
+pkgname=webcord
+version=4.14.0
+revision=1
+archs="x86_64"
+hostmakedepends="binutils tar zstd"
+depends="alsa-lib gtk+3 libnotify nss xdg-utils at-spi2-core libdrm libxcb"
+short_desc="Discord and Spacebar client based on Electron"
+maintainer="Crisis82 <crisis82@users.noreply.github.com>"
+license="MIT"
+homepage="https://github.com/SpacingBat3/WebCord"
+distfiles="${homepage}/releases/download/v${version}/webcord_${version}_amd64.deb"
+checksum=977df3d4cc1eaea1b5572c4a5bacd26909e20f67d25dc9e502198d121d4385a2
+nopie=yes
+nostrip=yes
+wrksrc="${pkgname}-${version}"
+
+do_extract() {
+	local deb="${XBPS_SRCDISTDIR}/${pkgname}-${version}/${distfiles##*/}"
+	local data_tar
+
+	mkdir -p "${wrksrc}"
+	cd "${wrksrc}"
+	ar x "${deb}"
+	data_tar="$(printf '%s\n' data.tar.* | head -n1)"
+
+	case "${data_tar}" in
+		*.xz) tar -xJf "${data_tar}" ;;
+		*.gz) tar -xzf "${data_tar}" ;;
+		*.zst) tar --zstd -xf "${data_tar}" ;;
+		*) msg_error "${pkgname}: unsupported data archive ${data_tar}\n" ;;
+	esac
+}
+
+do_install() {
+	vcopy usr /
+}
+
+post_install() {
+	vlicense usr/share/doc/webcord/copyright
+}

@@ -1,0 +1,42 @@
+# Template file for 'teams-for-linux'
+pkgname=teams-for-linux
+version=2.11.1
+revision=1
+archs="x86_64"
+hostmakedepends="binutils tar xz"
+depends="alsa-lib at-spi2-core gtk+3 libnotify libsecret nss libXScrnSaver libXtst xdg-utils util-linux-libs"
+short_desc="Unofficial Microsoft Teams desktop client"
+maintainer="Crisis82 <crisis82@users.noreply.github.com>"
+license="GPL-3.0-or-later"
+homepage="https://github.com/IsmaelMartinez/teams-for-linux"
+distfiles="${homepage}/releases/download/v${version}/teams-for-linux_${version}_amd64.deb"
+checksum=afeb3b31b17e74aff663955adb8062f9e8da41bf8f3407daac670c1d73103da1
+nopie=yes
+nostrip=yes
+wrksrc="${pkgname}-${version}"
+
+do_extract() {
+	local deb="${XBPS_SRCDISTDIR}/${pkgname}-${version}/${distfiles##*/}"
+	local data_tar
+
+	mkdir -p "${wrksrc}"
+	cd "${wrksrc}"
+	ar x "${deb}"
+	data_tar="$(printf '%s\n' data.tar.* | head -n1)"
+
+	case "${data_tar}" in
+		*.xz) tar -xJf "${data_tar}" ;;
+		*.gz) tar -xzf "${data_tar}" ;;
+		*.zst) tar --zstd -xf "${data_tar}" ;;
+		*) msg_error "${pkgname}: unsupported data archive ${data_tar}\n" ;;
+	esac
+}
+
+do_install() {
+	vcopy opt /
+	vcopy usr /
+}
+
+post_install() {
+	vlicense $FILESDIR/LICENSE
+}

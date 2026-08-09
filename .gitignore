@@ -1,0 +1,28 @@
+# Build artifacts
+void-packages/
+hostdir/
+masterdir/
+*.xbps
+*.xbps.sig
+*.xbps.sig2
+*-repodata
+*-repodata.sig
+
+# Local testing
+.local-build/
+*.log
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+*.key
+privkey*

@@ -1,0 +1,604 @@
+name: Build packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build scope
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - changed
+      packages:
+        description: Space or comma separated packages (used when mode=changed)
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "srcpkgs/**"
+      - "shlibs_append"
+      - "shlibs_remove"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: build-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build packages (x86_64 glibc)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:latest
+      options: --privileged
+
+    permissions:
+      contents: write
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Prepare container
+        shell: sh
+        run: |
+          set -eu
+          mkdir -p /etc/xbps.d
+          cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/
+          sed -i 's|repo-default|repo-ci|g' /etc/xbps.d/*-repository-*.conf
+          xbps-install -Syu xbps
+          xbps-install -yu
+          xbps-install -y sudo bash curl git jq
+          useradd -G xbuilder -M builder
+
+      - name: Checkout this repository
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "https://github.com/${{ github.repository }}.git" extra
+          cd extra
+          git fetch --no-tags origin "${{ github.sha }}" --depth 1
+          git checkout --detach "${{ github.sha }}"
+
+      - name: Determine build scope
+        id: scope
+        env:
+          INPUT_BUILD_MODE: ${{ github.event.inputs.build_mode }}
+          INPUT_PACKAGES: ${{ github.event.inputs.packages }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          cd extra
+
+          mapfile -t all_packages < <(find srcpkgs -maxdepth 1 -mindepth 1 -type d -printf "%f\n" | sort -u)
+
+          normalize_pkg_list() {
+            tr ',[:space:]' '\n' <<<"$1" | sed '/^$/d' | sort -u
+          }
+
+          mode_reason="unspecified"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            mode="${INPUT_BUILD_MODE:-full}"
+            mode_reason="manual dispatch"
+          else
+            mode="changed"
+            mode_reason="push/update changed templates"
+          fi
+
+          if [ "$mode" != "full" ] && [ "$mode" != "changed" ]; then
+            echo "::error::Invalid build mode: ${mode}"
+            exit 1
+          fi
+
+          declare -a packages=()
+          declare -a removed_packages=()
+
+          if [ "$mode" = "full" ]; then
+            packages=("${all_packages[@]}")
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              mode_reason="manual full build"
+            else
+              mode_reason="push event requiring full build"
+            fi
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            mode_reason="manual changed build"
+            if [ -n "${INPUT_PACKAGES//[[:space:],]/}" ]; then
+              mapfile -t packages < <(normalize_pkg_list "$INPUT_PACKAGES")
+            else
+              mode_reason="manual changed build with no package selection"
+              echo "::notice::No packages supplied for changed mode; skipping build."
+            fi
+          else
+            before="${BEFORE_SHA:-}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              mode="full"
+              mode_reason="initial push without diff base"
+              packages=("${all_packages[@]}")
+              echo "::notice::Initial push detected; using full build."
+            else
+              git fetch --no-tags origin "$before" --depth 1 || true
+              if ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+                mode="full"
+                mode_reason="missing diff base commit"
+                packages=("${all_packages[@]}")
+                removed_packages=()
+                echo "::notice::Unable to diff against ${before}; using full build."
+              else
+                mapfile -t packages < <(git diff --name-only "$before" "$GITHUB_SHA" | sed -n 's#^srcpkgs/\([^/]*\)/.*#\1#p' | sort -u)
+                mapfile -t removed_packages < <(git diff --name-only --diff-filter=D "$before" "$GITHUB_SHA" | sed -n 's#^srcpkgs/\([^/]*\)/.*#\1#p' | sort -u)
+
+                shlibs_remove_changed=$(git diff --name-only "$before" "$GITHUB_SHA" -- shlibs_remove | wc -l | tr -d ' ')
+                shlibs_append_changed=$(git diff --name-only "$before" "$GITHUB_SHA" -- shlibs_append | wc -l | tr -d ' ')
+
+                if [ "$shlibs_remove_changed" -gt 0 ] || [ "$shlibs_append_changed" -gt 0 ]; then
+                  mode="full"
+                  mode_reason="shlibs change requires full rebuild"
+                  packages=("${all_packages[@]}")
+                  removed_packages=()
+                  echo "::notice::Shlibs change detected; using full build."
+                fi
+              fi
+            fi
+          fi
+
+          if [ ${#packages[@]} -gt 0 ]; then
+            mapfile -t packages < <(
+              printf "%s\n" "${packages[@]}" | awk 'NF' | while IFS= read -r pkg; do
+                if [ -d "srcpkgs/${pkg}" ]; then
+                  printf "%s\n" "$pkg"
+                else
+                  echo "::warning::Skipping unknown package '${pkg}'" >&2
+                fi
+              done | sort -u
+            )
+          fi
+
+          if [ ${#removed_packages[@]} -gt 0 ]; then
+            mapfile -t removed_packages < <(printf "%s\n" "${removed_packages[@]}" | awk 'NF' | sort -u)
+          fi
+
+          if [ "$mode" = "changed" ] && [ ${#packages[@]} -eq 0 ] && [ ${#removed_packages[@]} -eq 0 ]; then
+            mode="none"
+            mode_reason="no package template changes after diff"
+          fi
+
+          {
+            echo "mode=${mode}"
+            echo "mode_reason=${mode_reason}"
+            echo "all_packages<<EOF"
+            printf "%s\n" "${all_packages[@]}"
+            echo "EOF"
+            echo "packages<<EOF"
+            printf "%s\n" "${packages[@]}"
+            echo "EOF"
+            echo "removed_packages<<EOF"
+            printf "%s\n" "${removed_packages[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Build mode: ${mode}"
+          echo "Build mode reason: ${mode_reason}"
+          echo "Packages to build: ${packages[*]:-<none>}"
+          echo "Packages to remove: ${removed_packages[*]:-<none>}"
+
+      - name: Report build scope
+        run: |
+          set -euo pipefail
+
+          mode="${{ steps.scope.outputs.mode }}"
+          mode_reason="${{ steps.scope.outputs.mode_reason }}"
+          trigger_event="${{ github.event_name }}"
+          requested="$(printf "%s\n" "${{ steps.scope.outputs.packages }}" | sed '/^$/d' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          removed="$(printf "%s\n" "${{ steps.scope.outputs.removed_packages }}" | sed '/^$/d' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+
+          [ -n "$requested" ] || requested="<none>"
+          [ -n "$removed" ] || removed="<none>"
+          [ -n "$mode_reason" ] || mode_reason="unspecified"
+
+          echo "::notice title=Build trigger::${trigger_event}"
+          echo "::notice title=Build mode::${mode}"
+          echo "::notice title=Build mode reason::${mode_reason}"
+          echo "::notice title=Requested packages::${requested}"
+          echo "::notice title=Removed packages::${removed}"
+
+          {
+            echo "## Build scope"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger event | \`${trigger_event}\` |"
+            echo "| Mode | \`${mode}\` |"
+            echo "| Mode reason | \`${mode_reason}\` |"
+            echo "| Requested packages | \`${requested}\` |"
+            echo "| Removed packages | \`${removed}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No build needed
+        if: steps.scope.outputs.mode == 'none'
+        run: echo "No package template changes detected."
+
+      - name: Checkout void-packages
+        if: steps.scope.outputs.mode != 'none'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/void-linux/void-packages.git void-packages
+          cd void-packages
+          git checkout --detach master
+
+      - name: Merge templates and shlibs overrides
+        if: steps.scope.outputs.mode != 'none'
+        run: |
+          set -euo pipefail
+          for pkgdir in extra/srcpkgs/*; do
+            [ -d "$pkgdir" ] || continue
+            pkg="$(basename "$pkgdir")"
+            rm -rf "void-packages/srcpkgs/${pkg}"
+            cp -av "$pkgdir" void-packages/srcpkgs/
+          done
+
+          SHLIBS_FILE="void-packages/common/shlibs"
+
+          if [ -f "extra/shlibs_remove" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              grep -vF "$line" "$SHLIBS_FILE" > "$SHLIBS_FILE.tmp" && mv "$SHLIBS_FILE.tmp" "$SHLIBS_FILE"
+            done < "extra/shlibs_remove"
+          fi
+
+          if [ -f "extra/shlibs_append" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              grep -qF "$line" "$SHLIBS_FILE" || echo "$line" >> "$SHLIBS_FILE"
+            done < "extra/shlibs_append"
+          fi
+
+      - name: Prepare masterdir
+        if: steps.scope.outputs.mode != 'none'
+        run: |
+          set -euo pipefail
+          cd void-packages
+          chown -R builder:builder .
+          sudo -Eu builder common/travis/set_mirror.sh
+          sudo -Eu builder common/travis/prepare.sh
+
+      - name: Build selected package templates
+        if: steps.scope.outputs.mode != 'none'
+        id: build_pkgs
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          PACKAGE_LIST: ${{ steps.scope.outputs.packages }}
+        run: |
+          set -euo pipefail
+          cd void-packages
+
+          mapfile -t requested_packages < <(printf "%s\n" "$PACKAGE_LIST" | sed '/^$/d')
+          if [ ${#requested_packages[@]} -eq 0 ]; then
+            {
+              echo "attempted_packages<<EOF"
+              echo "EOF"
+              echo "successful_packages<<EOF"
+              echo "EOF"
+              echo "failed_packages<<EOF"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t sorted_packages < <(sudo -Eu builder ./xbps-src -Q sort-dependencies "${requested_packages[@]}")
+
+          declare -a successful_packages=()
+          declare -a failed_packages=()
+          full_failed=0
+          max_attempts=3
+
+          for pkg in "${sorted_packages[@]}"; do
+            echo "::group::Building ${pkg}"
+
+            build_ok=0
+            for attempt in $(seq 1 "$max_attempts"); do
+              echo "::notice::${pkg}: build attempt ${attempt}/${max_attempts}"
+              if sudo -Eu builder ./xbps-src -j"$(nproc)" -Q pkg "${pkg}"; then
+                build_ok=1
+                break
+              fi
+
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                echo "::warning::${pkg}: attempt ${attempt} failed; cleaning and retrying."
+                sudo -Eu builder ./xbps-src clean "${pkg}" || true
+                sleep $((attempt * 5))
+              fi
+            done
+
+            if [ "$build_ok" -eq 1 ]; then
+              successful_packages+=("${pkg}")
+            else
+              failed_packages+=("${pkg}")
+              if [ "$MODE" = "full" ]; then
+                full_failed=1
+                echo "::error::Full build failed on ${pkg}."
+                echo "::endgroup::"
+                break
+              fi
+              echo "::warning::${pkg} failed and will be skipped for this publish."
+            fi
+            echo "::endgroup::"
+          done
+
+          {
+            echo "attempted_packages<<EOF"
+            printf "%s\n" "${sorted_packages[@]}"
+            echo "EOF"
+            echo "successful_packages<<EOF"
+            printf "%s\n" "${successful_packages[@]}"
+            echo "EOF"
+            echo "failed_packages<<EOF"
+            printf "%s\n" "${failed_packages[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$full_failed" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: Assemble repository files
+        if: steps.scope.outputs.mode != 'none'
+        id: assemble_repo
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          ALL_PACKAGES: ${{ steps.scope.outputs.all_packages }}
+          SUCCESSFUL_PACKAGES: ${{ steps.build_pkgs.outputs.successful_packages }}
+          REMOVED_PACKAGES: ${{ steps.scope.outputs.removed_packages }}
+          PRIV_KEY: ${{ secrets.PRIV_KEY }}
+          XBPS_PASSPHRASE: ${{ secrets.PRIV_KEY_PASSPHRASE }}
+          GH_TOKEN: ${{ github.token }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          BINPKGS_DIR="void-packages/hostdir/binpkgs"
+          TAG="repository-x86_64"
+          API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          ACCEPT_JSON="Accept: application/vnd.github+json"
+
+          if [ -z "${PRIV_KEY:-}" ]; then
+            echo "::error::Missing PRIV_KEY secret. Configure repository signing key."
+            exit 1
+          fi
+
+          rm -rf /tmp/repo
+          mkdir -p /tmp/repo
+
+          copy_package_files() {
+            local pkg="$1"
+            local -a built_files=()
+            mapfile -t built_files < <(find "${BINPKGS_DIR}" -maxdepth 2 -type f -name "${pkg}-*.xbps" -printf "%p\n" | sort)
+            if [ ${#built_files[@]} -eq 0 ]; then
+              echo "::error::No built package files found for ${pkg}."
+              return 1
+            fi
+            cp -v "${built_files[@]}" /tmp/repo/
+          }
+
+          if [ "$MODE" = "full" ]; then
+            mapfile -t package_list < <(printf "%s\n" "$ALL_PACKAGES" | sed '/^$/d')
+            for pkg in "${package_list[@]}"; do
+              copy_package_files "$pkg"
+            done
+          else
+            resp=$(curl -s -w "\n%{http_code}" -H "$AUTH" -H "$ACCEPT_JSON" "${API}/releases/tags/${TAG}" || true)
+            code=$(echo "$resp" | tail -n1)
+            body=$(echo "$resp" | sed '$d')
+
+            if [ "$code" != "404" ]; then
+              if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+                echo "::error::Failed to query release ${TAG} (HTTP ${code})."
+                echo "$body"
+                exit 1
+              fi
+
+              release_id=$(echo "$body" | jq -r '.id')
+              if [ -n "$release_id" ] && [ "$release_id" != "null" ]; then
+                assets=$(curl -s -H "$AUTH" -H "$ACCEPT_JSON" "${API}/releases/${release_id}/assets?per_page=100")
+                echo "$assets" | jq -r '.[] | [.id, .name] | @tsv' | while IFS=$'\t' read -r asset_id asset_name; do
+                  [ -n "$asset_id" ] || continue
+                  case "$asset_name" in
+                    *.xbps|*.sig2|index*|*-repodata*)
+                      curl -fsSL -H "$AUTH" -H "Accept: application/octet-stream" \
+                        "${API}/releases/assets/${asset_id}" -o "/tmp/repo/${asset_name}"
+                      ;;
+                  esac
+                done
+              fi
+            fi
+
+            mapfile -t successful_packages < <(printf "%s\n" "$SUCCESSFUL_PACKAGES" | sed '/^$/d')
+            mapfile -t removed_packages < <(printf "%s\n" "$REMOVED_PACKAGES" | sed '/^$/d')
+
+            rm -f /tmp/repo/index* /tmp/repo/*-repodata*
+
+            for pkg in "${successful_packages[@]}"; do
+              rm -f /tmp/repo/${pkg}-*.xbps /tmp/repo/${pkg}-*.sig2
+              copy_package_files "$pkg"
+            done
+
+            for pkg in "${removed_packages[@]}"; do
+              rm -f /tmp/repo/${pkg}-*.xbps /tmp/repo/${pkg}-*.sig2
+            done
+          fi
+
+          if ! find /tmp/repo -maxdepth 1 -type f -name "*.xbps" | grep -q .; then
+            echo "::error::No binary packages found to index."
+            exit 1
+          fi
+
+          rm -f /tmp/repo/*.sig2
+
+          cd /tmp/repo
+          umask 077
+          printf "%s\n" "$PRIV_KEY" > private.pem
+
+          xbps-rindex -a ./*.xbps
+          xbps-rindex -r "$PWD"
+          xbps-rindex -s --signedby "Crisis82 <crisis82@users.noreply.github.com>" --privkey private.pem "$PWD"
+          xbps-rindex -S --privkey private.pem ./*.xbps
+          xbps-rindex -c "$PWD"
+
+          rm -f private.pem
+
+      - name: Publish release assets
+        if: steps.scope.outputs.mode != 'none'
+        id: publish_assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          TAG="repository-x86_64"
+          API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+          UPLOADS="https://uploads.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          ACCEPT="Accept: application/vnd.github+json"
+
+          resp=$(curl -s -w "\n%{http_code}" -H "$AUTH" -H "$ACCEPT" "${API}/releases/tags/${TAG}" || true)
+          code=$(echo "$resp" | tail -n1)
+          body=$(echo "$resp" | sed '$d')
+
+          if [ "$code" = "404" ]; then
+            body=$(curl -fsS -X POST -H "$AUTH" -H "$ACCEPT" -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"${TAG}\",\"target_commitish\":\"${{ github.sha }}\",\"name\":\"Binary repository for x86_64\",\"body\":\"Add with: repository=https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${TAG}\"}" \
+              "${API}/releases")
+          elif [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::Failed to query release ${TAG} (HTTP ${code})."
+            echo "$body"
+            exit 1
+          fi
+
+          release_id=$(echo "$body" | jq -r '.id')
+          if [ -z "$release_id" ] || [ "$release_id" = "null" ]; then
+            release_id=$(curl -fsS -H "$AUTH" -H "$ACCEPT" "${API}/releases/tags/${TAG}" | jq -r '.id')
+          fi
+
+          curl -fsS -H "$AUTH" -H "$ACCEPT" "${API}/releases/${release_id}/assets?per_page=100" | jq -r '.[].id' | while IFS= read -r asset_id; do
+            [ -z "$asset_id" ] && continue
+            curl -fsS -X DELETE -H "$AUTH" -H "$ACCEPT" "${API}/releases/assets/${asset_id}" >/dev/null
+          done
+
+          for f in /tmp/repo/*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            curl -fsS -X POST -H "$AUTH" -H "$ACCEPT" -H "Content-Type: application/octet-stream" \
+              --data-binary "@${f}" \
+              "${UPLOADS}/releases/${release_id}/assets?name=${name}" >/dev/null
+          done
+
+      - name: Report partial build failures
+        if: steps.scope.outputs.mode == 'changed' && steps.build_pkgs.outputs.failed_packages != ''
+        env:
+          FAILED_PACKAGES: ${{ steps.build_pkgs.outputs.failed_packages }}
+        run: |
+          set -euo pipefail
+          failed=$(printf "%s\n" "$FAILED_PACKAGES" | sed '/^$/d' | tr '\n' ' ')
+          echo "::warning::Skipped failed packages: ${failed}"
+
+      - name: Report build result
+        if: always()
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+          MODE: ${{ steps.scope.outputs.mode }}
+          MODE_REASON: ${{ steps.scope.outputs.mode_reason }}
+          REQUESTED_PACKAGES: ${{ steps.scope.outputs.packages }}
+          REMOVED_PACKAGES: ${{ steps.scope.outputs.removed_packages }}
+          ATTEMPTED_PACKAGES: ${{ steps.build_pkgs.outputs.attempted_packages }}
+          SUCCESSFUL_PACKAGES: ${{ steps.build_pkgs.outputs.successful_packages }}
+          FAILED_PACKAGES: ${{ steps.build_pkgs.outputs.failed_packages }}
+          BUILD_STEP_OUTCOME: ${{ steps.build_pkgs.outcome }}
+          ASSEMBLE_STEP_OUTCOME: ${{ steps.assemble_repo.outcome }}
+          PUBLISH_STEP_OUTCOME: ${{ steps.publish_assets.outcome }}
+        run: |
+          set -euo pipefail
+
+          to_inline_list() {
+            local raw="$1"
+            local cleaned
+            cleaned="$(printf "%s\n" "$raw" | sed '/^$/d' | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+            if [ -z "$cleaned" ]; then
+              echo "<none>"
+            else
+              echo "$cleaned"
+            fi
+          }
+
+          count_lines() {
+            printf "%s\n" "$1" | sed '/^$/d' | wc -l | tr -d ' '
+          }
+
+          requested_inline="$(to_inline_list "$REQUESTED_PACKAGES")"
+          attempted_inline="$(to_inline_list "$ATTEMPTED_PACKAGES")"
+          successful_inline="$(to_inline_list "$SUCCESSFUL_PACKAGES")"
+          failed_inline="$(to_inline_list "$FAILED_PACKAGES")"
+          removed_inline="$(to_inline_list "$REMOVED_PACKAGES")"
+
+          requested_count="$(count_lines "$REQUESTED_PACKAGES")"
+          attempted_count="$(count_lines "$ATTEMPTED_PACKAGES")"
+          successful_count="$(count_lines "$SUCCESSFUL_PACKAGES")"
+          failed_count="$(count_lines "$FAILED_PACKAGES")"
+          removed_count="$(count_lines "$REMOVED_PACKAGES")"
+
+          summary_status="success"
+          if [ "$MODE" = "none" ]; then
+            summary_status="no-op"
+          elif [ "$failed_count" -gt 0 ]; then
+            summary_status="failed"
+          fi
+
+          partial_note="n/a"
+          if [ "$MODE" = "changed" ] && [ "$failed_count" -gt 0 ]; then
+            partial_note="changed mode published successful packages only; failed packages kept previous release versions"
+          elif [ "$MODE" = "changed" ]; then
+            partial_note="all changed packages built and published"
+          fi
+
+          echo "::notice title=Build result::status=${summary_status}, trigger=${TRIGGER_EVENT}, mode=${MODE}, attempted=${attempted_count}, success=${successful_count}, failed=${failed_count}"
+          if [ "$failed_count" -gt 0 ]; then
+            echo "::warning title=Failed packages::${failed_inline}"
+            if [ "$MODE" = "changed" ]; then
+              echo "::warning title=Partial publish::${partial_note}"
+            fi
+          fi
+
+          {
+            echo "## Build result"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Status | \`${summary_status}\` |"
+            echo "| Trigger event | \`${TRIGGER_EVENT:-unknown}\` |"
+            echo "| Mode | \`${MODE:-unknown}\` |"
+            echo "| Mode reason | \`${MODE_REASON:-unspecified}\` |"
+            echo "| Requested package count | \`${requested_count}\` |"
+            echo "| Attempted package count | \`${attempted_count}\` |"
+            echo "| Successful package count | \`${successful_count}\` |"
+            echo "| Failed package count | \`${failed_count}\` |"
+            echo "| Removed package count | \`${removed_count}\` |"
+            echo "| Changed-mode publish note | \`${partial_note}\` |"
+            echo "| Build step outcome | \`${BUILD_STEP_OUTCOME:-n/a}\` |"
+            echo "| Assemble step outcome | \`${ASSEMBLE_STEP_OUTCOME:-n/a}\` |"
+            echo "| Publish step outcome | \`${PUBLISH_STEP_OUTCOME:-n/a}\` |"
+            echo "| Requested packages | \`${requested_inline}\` |"
+            echo "| Attempted packages | \`${attempted_inline}\` |"
+            echo "| Successful packages | \`${successful_inline}\` |"
+            echo "| Failed packages | \`${failed_inline}\` |"
+            echo "| Removed packages | \`${removed_inline}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed_count" -gt 0 ]; then
+            echo "::error::One or more package builds failed: ${failed_inline}"
+            exit 1
+          fi

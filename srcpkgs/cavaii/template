@@ -1,0 +1,23 @@
+# Template file for 'cavaii'
+pkgname=cavaii
+version=0.1.3
+revision=1
+build_style=cargo
+hostmakedepends="pkg-config"
+makedepends="gtk4-devel gtk4-layer-shell-devel"
+depends="cava"
+short_desc="Desktop audio visualizer overlay for Wayland based on cava"
+maintainer="Crisis82 <crisis82@users.noreply.github.com>"
+license="MIT"
+homepage="https://github.com/Crisis82/cavaii"
+distfiles="${homepage}/archive/refs/tags/v${version}.tar.gz"
+checksum=81d47a647e29fce5b75dd873f627fe3105469c6b0109c8dbd285844d9d1c7270
+
+do_install() {
+  vbin target/${RUST_TARGET}/release/cavaii
+  vbin target/${RUST_TARGET}/release/cavaii-daemon
+}
+
+post_install() {
+  vlicense LICENSE
+}

@@ -1,0 +1,290 @@
+name: Check updates
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 5 * * *"
+
+concurrency:
+  group: update-check
+  cancel-in-progress: false
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth 1 origin "${REF_NAME}"
+          git checkout -B "${REF_NAME}" FETCH_HEAD
+
+      - name: Update templates and checksums
+        id: updater
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t targets <<'EOF'
+          aquamarine|hyprwm/aquamarine
+          discord|discord
+          glaze|stephenberry/glaze
+          hyprcursor|hyprwm/hyprcursor
+          hyprgraphics|hyprwm/hyprgraphics
+          hypridle|hyprwm/hypridle
+          hyprland|hyprwm/Hyprland
+          hyprland-protocols|hyprwm/hyprland-protocols
+          hyprlang|hyprwm/hyprlang
+          hyprlock|hyprwm/hyprlock
+          hyprpaper|hyprwm/hyprpaper
+          hyprpicker|hyprwm/hyprpicker
+          hyprtoolkit|hyprwm/hyprtoolkit
+          hyprutils|hyprwm/hyprutils
+          hyprwayland-scanner|hyprwm/hyprwayland-scanner
+          hyprwire|hyprwm/hyprwire
+          libspng|randy408/libspng
+          teams-for-linux|IsmaelMartinez/teams-for-linux
+          webcord|SpacingBat3/WebCord
+          spotify|spotify
+          sdbus-cpp|Kistler-Group/sdbus-cpp
+          xdg-desktop-portal-hyprland|hyprwm/xdg-desktop-portal-hyprland
+          cavaii|Crisis82/cavaii
+          calci|Crisis82/calci
+          EOF
+
+          updates=0
+          : > updates.txt
+
+          for entry in "${targets[@]}"; do
+            pkg="${entry%%|*}"
+            repo="${entry##*|}"
+            template="srcpkgs/${pkg}/template"
+            [ -f "$template" ] || continue
+
+            token="${GH_TOKEN}"
+
+            current_version="$(awk -F= '/^version=/{print $2}' "$template")"
+            [ -n "$current_version" ] || continue
+            current_subver="$(awk -F= '/^_subver=/{print $2}' "$template" || true)"
+
+            latest_tag=""
+            latest_version=""
+            latest_subver=""
+
+            if [ "$pkg" = "discord" ]; then
+              latest_version="$(curl -fsSL "https://discordapp.com/api/updates/stable?platform=linux" | jq -r '.name // empty' || true)"
+              if [ -z "$latest_version" ]; then
+                latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://dl.discordapp.net/apps/linux/latest/discord.tar.gz" || true)"
+                latest_version="$(printf "%s" "$latest_url" | sed -n 's#.*/apps/linux/\([^/]*\)/.*#\1#p')"
+              fi
+              if [ -z "$latest_version" ]; then
+                echo "Skipping ${pkg}: failed to resolve latest version from Discord endpoints"
+                continue
+              fi
+              latest_tag="v${latest_version}"
+            elif [ "$pkg" = "spotify" ]; then
+              spotify_site="http://repository.spotify.com/pool/non-free/s/spotify-client"
+              latest_build="$(curl -fsSL "$spotify_site/" | grep -oE 'spotify-client_[^"]+_amd64\.deb' | sed -E 's/^spotify-client_(.+)_amd64\.deb$/\1/' | sort -V | tail -n1 || true)"
+              if [ -z "$latest_build" ]; then
+                echo "Skipping ${pkg}: failed to resolve latest version from ${spotify_site}"
+                continue
+              fi
+              latest_version="$(printf "%s" "$latest_build" | cut -d. -f1-3)"
+              latest_subver="$(printf "%s" "$latest_build" | cut -d. -f4-)"
+              if [ -z "$latest_version" ] || [ -z "$latest_subver" ]; then
+                echo "Skipping ${pkg}: failed to split version/subver from ${latest_build}"
+                continue
+              fi
+              latest_tag="v${latest_version}"
+            else
+              release_json="$(curl -fsSL -H "Authorization: Bearer ${token}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/latest" || true)"
+              latest_tag="$(printf "%s" "$release_json" | jq -r '.tag_name // empty')"
+
+              if [ -z "$latest_tag" ]; then
+                tag_json="$(curl -fsSL -H "Authorization: Bearer ${token}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/tags?per_page=1" || true)"
+                latest_tag="$(printf "%s" "$tag_json" | jq -r '.[0].name // empty')"
+              fi
+            fi
+
+            [ -n "$latest_tag" ] || continue
+            if [ -z "$latest_version" ]; then
+              latest_version="${latest_tag#v}"
+            fi
+
+            if [ "$pkg" = "spotify" ] && [ "$latest_version" = "$current_version" ] && [ "$latest_subver" = "$current_subver" ]; then
+              continue
+            fi
+
+            if [ "$pkg" != "spotify" ] && [ "$latest_version" = "$current_version" ]; then
+              continue
+            fi
+
+            dist_expr="$(awk -F= '/^distfiles=/{print $2}' "$template" | tr -d '"')"
+            homepage="$(awk -F= '/^homepage=/{print $2}' "$template" | tr -d '"')"
+
+            if [ "$pkg" = "spotify" ]; then
+              dist_url="http://repository.spotify.com/pool/non-free/s/spotify-client/spotify-client_${latest_version}.${latest_subver}_amd64.deb"
+            else
+              dist_url="$dist_expr"
+              dist_url="${dist_url//\$\{homepage\}/${homepage}}"
+              dist_url="${dist_url//\$\{pkgname\}/${pkg}}"
+              dist_url="${dist_url//\$\{version\}/${latest_version}}"
+              dist_url="${dist_url//${current_version}/${latest_version}}"
+            fi
+
+            tmp_file="/tmp/${pkg}-${latest_version}.tar.gz"
+            if ! curl -fsSL -H "Authorization: Bearer ${token}" -L -o "$tmp_file" "$dist_url"; then
+              echo "Skipping ${pkg}: failed to download ${dist_url}"
+              continue
+            fi
+            new_checksum="$(sha256sum "$tmp_file" | awk '{print $1}')"
+
+            sed -i "s/^version=.*/version=${latest_version}/" "$template"
+            if [ "$pkg" = "spotify" ]; then
+              sed -i "s/^_subver=.*/_subver=${latest_subver}/" "$template"
+            fi
+            sed -i "s/^revision=.*/revision=1/" "$template"
+            sed -i "s/^checksum=.*/checksum=${new_checksum}/" "$template"
+
+            if [ -f shlibs_append ]; then
+              soversion=""
+              if grep -qE "[[:space:]]${pkg}-" shlibs_append; then
+                extract_dir="/tmp/${pkg}-${latest_version}-extract"
+                rm -rf "$extract_dir"
+                mkdir -p "$extract_dir"
+                if tar -xzf "$tmp_file" -C "$extract_dir" 2>/dev/null; then
+                  soversion="$(grep -RhoE 'SOVERSION[[:space:]]+[0-9]+' "$extract_dir" 2>/dev/null | grep -oE '[0-9]+' | sort -u | head -n1 || true)"
+                fi
+              fi
+
+              awk -v pkg="$pkg" -v pkgver="${pkg}-${latest_version}_1" -v soversion="$soversion" '{
+                if (index($2, pkg "-") == 1) {
+                  $2 = pkgver
+                  if (soversion != "" && $1 ~ /\.so\.[0-9]+$/) {
+                    sub(/\.so\.[0-9]+$/, ".so." soversion, $1)
+                  }
+                }
+                print
+              }' shlibs_append > shlibs_append.tmp && mv shlibs_append.tmp shlibs_append
+            fi
+
+            printf "%s: %s -> %s\n" "$pkg" "$current_version" "$latest_version" >> updates.txt
+            updates=1
+          done
+
+          if [ -f shlibs_append ]; then
+            sort -u -o shlibs_append shlibs_append
+          fi
+
+          if [ "$updates" -eq 1 ]; then
+            echo "updates_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "updates_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit updates to branch
+        if: steps.updater.outputs.updates_found == 'true'
+        id: commit_updates
+        run: |
+          set -euo pipefail
+          branch="auto/update-packages"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add srcpkgs shlibs_append
+
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore: update package versions and checksums"
+          git push --force origin "$branch"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        if: steps.updater.outputs.updates_found == 'true' && steps.commit_updates.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner="${REPO%/*}"
+          repo="${REPO#*/}"
+          branch="auto/update-packages"
+          title="chore: update package versions and checksums"
+          updates_payload="$(cat updates.txt)"
+          updates_hash="$(printf "%s" "$updates_payload" | sha256sum | awk '{print $1}')"
+          body=$(cat <<EOF
+          <!-- updates-hash:${updates_hash} -->
+          Automated update check detected upstream releases and refreshed template versions/checksums.
+
+          Updated packages:
+
+          \`\`\`
+          ${updates_payload}
+          \`\`\`
+          EOF
+          )
+
+          existing="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${owner}/${repo}/pulls?head=${owner}:${branch}&base=main&state=open")"
+          pr_number="$(echo "$existing" | jq -r '.[0].number // empty')"
+
+          if [ -n "$pr_number" ]; then
+            existing_hash="$(echo "$existing" | jq -r '.[0].body // ""' | sed -n 's/.*<!-- updates-hash:\([0-9a-f]\{64\}\) -->.*/\1/p' | head -n1)"
+            if [ "$existing_hash" = "$updates_hash" ]; then
+              echo "Open PR #${pr_number} already covers this exact update set (${updates_hash})."
+              exit 0
+            fi
+            curl -fsS -X PATCH \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg title "$title" --arg body "$body" '{title:$title, body:$body}')" \
+              "https://api.github.com/repos/${owner}/${repo}/pulls/${pr_number}" >/dev/null
+            exit 0
+          fi
+
+          open_prs="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${owner}/${repo}/pulls?base=main&state=open&per_page=100")"
+          duplicate_pr="$(echo "$open_prs" | jq -r --arg marker "<!-- updates-hash:${updates_hash} -->" --arg branch "$branch" \
+            '.[] | select(.head.ref != $branch and ((.body // "") | contains($marker))) | .number' | head -n1)"
+          if [ -n "$duplicate_pr" ]; then
+            echo "Equivalent update PR already exists (#${duplicate_pr}) for hash ${updates_hash}; skipping new PR."
+            exit 0
+          fi
+
+          response="$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg title "$title" --arg head "$branch" --arg base "main" --arg body "$body" '{title:$title, head:$head, base:$base, body:$body}')" \
+            "https://api.github.com/repos/${owner}/${repo}/pulls")"
+          code="$(echo "$response" | tail -n1)"
+          pr_body="$(echo "$response" | sed '$d')"
+
+          if [ "$code" = "201" ]; then
+            exit 0
+          fi
+
+          message="$(echo "$pr_body" | jq -r '.message // empty')"
+          if echo "$message" | grep -q "not permitted to create or approve pull requests"; then
+            echo "PR creation is disabled for GITHUB_TOKEN in this repository. Branch '${branch}' was pushed successfully."
+            exit 0
+          fi
+
+          echo "$pr_body"
+          exit 1

@@ -1,0 +1,22 @@
+# Template file for 'ags'
+pkgname=ags
+version=3.1.2
+revision=3
+build_style=meson
+configure_args="-Db_pie=true"
+nopie_files="/usr/bin/ags"
+hostmakedepends="gjs go meson ninja nodejs pkgconf"
+makedepends="gobject-introspection gtk+3-devel gtk-layer-shell-devel gtk4-devel gtk4-layer-shell-devel"
+depends="gjs gobject-introspection gtk+3 gtk-layer-shell gtk4 gtk4-layer-shell"
+short_desc="Aylurs's Gtk Shell (AGS), an eww inspired gtk widget system"
+maintainer="Crisis82 <crisis82@users.noreply.github.com>"
+license="GPL-3.0-or-later"
+homepage="https://github.com/Aylur/ags"
+changelog="${homepage}/releases"
+distfiles="${changelog}/download/v${version}/ags-v${version}.tar.gz"
+checksum=cefed61736acdd0d15fcc191191309d1072dbfb0fe0062b43e5d9730b5408297
+
+post_install() {
+  vlicense LICENSE
+  vlicense node_modules/gnim/LICENSE LICENSE.gnim
+}
