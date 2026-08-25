@@ -1,6 +1,6 @@
 # Template file for 'teams-for-linux'
 pkgname=teams-for-linux
-version=2.17.0
+version=2.17.1
 revision=1
 archs="x86_64"
 hostmakedepends="binutils tar xz"
@@ -10,7 +10,7 @@ maintainer="Crisis82 <crisis82@users.noreply.github.com>"
 license="GPL-3.0-or-later"
 homepage="https://github.com/IsmaelMartinez/teams-for-linux"
 distfiles="${homepage}/releases/download/v${version}/teams-for-linux_${version}_amd64.deb"
-checksum=80283457504e6bc46fbb14772316688bbcae653e67073838cfa338b5c40f1bdb
+checksum=da00972366b49fb688e511029234f0ac3e2df3c4b34521b424b1210bb5262774
 nopie=yes
 nostrip=yes
 wrksrc="${pkgname}-${version}"
